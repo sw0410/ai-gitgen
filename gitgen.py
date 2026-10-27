@@ -1,11 +1,25 @@
 """gitgen - git 변경 사항으로 커밋 메시지/PR 초안을 만드는 CLI.
 
-스텝 1: Git 수집만 (API 호출 없음)
-사용법: python gitgen.py commit
+스텝 1: Git 수집 (commit)
+스텝 2: AI API 단독 호출 확인 (ping)
+사용법: python gitgen.py commit | python gitgen.py ping
 """
+import json
 import os
 import subprocess
 import sys
+import urllib.error
+import urllib.request
+
+# --- AI API 설정 ---
+# 주소와 모델은 환경변수로 바꿀 수 있다 (기관 서버 등). 없으면 아래 기본값을 쓴다.
+API_URL = os.environ.get("GITGEN_API_URL", "https://api.anthropic.com/v1/messages")
+API_KEY_ENV = "ANTHROPIC_API_KEY"
+API_VERSION = "2023-06-01"
+DEFAULT_MODEL = os.environ.get("GITGEN_MODEL", "claude-haiku-5-5")
+DEFAULT_TEMPERATURE = 0.3
+DEFAULT_MAX_TOKENS = 300
+TIMEOUT_SEC = 30
 
 
 def run_git(*args):
@@ -46,14 +60,71 @@ def collect_changes():
     return status, diff, source
 
 
+def call_ai(prompt, model=DEFAULT_MODEL, temperature=DEFAULT_TEMPERATURE,
+            max_tokens=DEFAULT_MAX_TOKENS):
+    """AI API를 1회 호출해 응답 텍스트를 돌려준다. 키는 환경변수에서만 읽는다."""
+    key = os.environ.get(API_KEY_ENV)
+    if not key:
+        sys.exit(f"[설정 오류] 환경변수 {API_KEY_ENV}가 없습니다.\n"
+                 f"  zsh/bash   : export {API_KEY_ENV}=\"키\"\n"
+                 f"  PowerShell : $env:{API_KEY_ENV}=\"키\"")
+
+    body = json.dumps({
+        "model": model,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "messages": [{"role": "user", "content": prompt}],
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        API_URL, data=body, method="POST",
+        headers={
+            "x-api-key": key,
+            "anthropic-version": API_VERSION,
+            "content-type": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT_SEC) as res:
+            data = json.load(res)
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", errors="replace")
+        hint = {401: "API Key가 올바른지 확인하세요",
+                403: "이 키로 해당 모델/기능을 쓸 권한이 없습니다",
+                404: "모델 이름이 올바른지 확인하세요",
+                429: "요청이 너무 많거나 한도를 넘었습니다. 잠시 후 다시 시도하세요"}.get(e.code, "")
+        sys.exit(f"[API 오류 {e.code}] {hint}\n{detail}".rstrip())
+    except urllib.error.URLError as e:
+        sys.exit(f"[네트워크 오류] 서버에 연결할 수 없습니다: {e.reason}")
+    except TimeoutError:
+        sys.exit(f"[네트워크 오류] {TIMEOUT_SEC}초 안에 응답이 오지 않았습니다")
+
+    try:
+        text = "".join(b["text"] for b in data["content"] if b.get("type") == "text")
+    except (KeyError, TypeError):
+        sys.exit(f"[응답 형식 오류] 예상하지 못한 응답입니다: {str(data)[:300]}")
+
+    print(f"[log] API 호출 1회 (url={API_URL}, model={model}, "
+          f"temperature={temperature}, max_tokens={max_tokens})")
+    return text.strip()
+
+
 def print_section(title, body):
     line = "=" * 50
     print(f"{line}\n[{title}]\n{line}\n{body.rstrip()}\n")
 
 
+def cmd_ping():
+    """git 없이 API 연결만 확인한다 (스텝 2)."""
+    answer = call_ai("한 문장으로 짧게 인사해줘.")
+    print_section("API 응답", answer)
+
+
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "ping":
+        return cmd_ping()
     if len(sys.argv) < 2 or sys.argv[1] != "commit":
-        sys.exit("사용법: python gitgen.py commit")
+        sys.exit("사용법: python gitgen.py commit | python gitgen.py ping")
 
     ensure_repo_root()
     status, diff, source = collect_changes()
